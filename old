@@ -1,0 +1,448 @@
+// src/App.jsx
+import React, { useState, useEffect, useRef } from 'react';
+import { Munkres } from 'munkres-js';
+import {
+  Box,
+  Drawer,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+  Button,
+  Typography,
+  Paper,
+  Stack
+} from '@mui/material';
+
+const GRID_SIZE = 10;
+const SIMULATION_STEPS = 20;
+const CELL_SIZE = 40;
+const DRAWER_WIDTH = 240;
+
+// Shape generators
+const generateRectangle = (n = GRID_SIZE) => {
+  const cx = Math.floor(n/2), cy = Math.floor(n/2);
+  const out = [];
+  for (let dx=-2; dx<2; dx++) {
+    for (let dy=-2; dy<3; dy++) {
+      out.push({ x: cx+dx, y: cy+dy });
+    }
+  }
+  return out;
+};
+const generateDiamond = (n = GRID_SIZE) => {
+  const cx = Math.floor(n/2), cy = Math.floor(n/2);
+  const offs = [
+    [-1,0],[1,0],[0,-1],[0,1],
+    [-2,0],[2,0],[0,-2],[0,2],
+    [-1,-1],[-1,1],[1,-1],[1,1],
+    [-2,-1],[-2,1],[2,-1],[2,1],
+    [-1,-2],[-1,2],[1,-2],[1,2],
+  ];
+  return offs
+    .map(([dx,dy]) => ({ x:cx+dx, y:cy+dy }))
+    .filter(p => p.x>=0 && p.x<n && p.y>=0 && p.y<n);
+};
+
+// A* + Hungarian helpers
+const heuristic = (p, g) => Math.abs(p.x - g.x) + Math.abs(p.y - g.y);
+const neighbors = ({ x, y }) => [
+  { x:x+1, y }, { x:x-1, y }, { x, y:y+1 }, { x, y:y-1 },
+  { x:x+1, y:y+1 }, { x:x-1, y:y-1 }, { x:x+1, y:y-1 }, { x:x-1, y:y+1 },
+];
+const within = (p, n = GRID_SIZE) => p.x >= 0 && p.x < n && p.y >= 0 && p.y < n;
+
+function planPath(start, goal, t0, barriers, occupied) {
+  const open = [{ pos: start, t: t0, g: 0, h: heuristic(start, goal), parent: null }];
+  open[0].f = open[0].g + open[0].h;
+  const closed = new Map();
+  closed.set(`${start.x},${start.y},${t0}`, open[0]);
+
+  while (open.length) {
+    let iMin = 0;
+    for (let i = 1; i < open.length; i++)
+      if (open[i].f < open[iMin].f) iMin = i;
+    const cur = open.splice(iMin, 1)[0];
+    if (cur.pos.x === goal.x && cur.pos.y === goal.y) {
+      const path = [];
+      let node = cur;
+      while (node) {
+        path.unshift({ pos: node.pos, t: node.t });
+        node = node.parent;
+      }
+      return path;
+    }
+    const nt = cur.t + 1;
+    for (const nb of neighbors(cur.pos)) {
+      if (!within(nb)) continue;
+      if (barriers.has(`${nb.x},${nb.y}`)) continue;
+      if (occupied.has(`${nb.x},${nb.y},${nt}`)) continue;
+      const g2 = cur.g + 1, key = `${nb.x},${nb.y},${nt}`, ex = closed.get(key);
+      if (!ex || g2 < ex.g) {
+        const node = { pos: nb, t: nt, g: g2, h: heuristic(nb, goal), parent: cur };
+        node.f = node.g + node.h;
+        open.push(node);
+        closed.set(key, node);
+      }
+    }
+  }
+  return null;
+}
+
+function hungarianAssignment(agents, cells) {
+  const cost = cells.map(c =>
+    agents.map(a => Math.abs(a.x - c.x) + Math.abs(a.y - c.y))
+  );
+  const m = new Munkres();
+  return m.compute(cost).reduce((map, [r, c]) => {
+    map[agents[c].id] = cells[r];
+    return map;
+  }, {});
+}
+
+// Main App
+export default function App() {
+  // modes & data
+  const [shapeType, setShapeType] = useState('diamond'); // 'diamond'|'rectangle'|'custom'
+  const [barrierMode, setBarrierMode] = useState(false);
+  const [agentMode, setAgentMode] = useState('none');    // 'none'|'add'|'remove'
+  const [customShapeMode, setCustomShapeMode] = useState(false);
+  const [barriers, setBarriers] = useState(new Set());
+  const [customAgents, setCustomAgents] = useState([]);
+  const nextAgentId = useRef(0);
+
+  // custom shape cells
+  const [customShapeCells, setCustomShapeCells] = useState([]);
+
+  // simulation state
+  const [shapeCells, setShapeCells] = useState([]);
+  const [agents, setAgents] = useState([]);
+  const [iter, setIter] = useState(0);
+  const [history, setHistory] = useState([]);
+  const reservationRef = useRef(new Set());
+  const intervalRef    = useRef(null);
+
+  // initialize default agents on mount
+  useEffect(() => {
+    const defs = [];
+    let id = 0;
+    [1, 0].forEach(pyY => {
+      const y = GRID_SIZE - 1 - pyY;
+      for (let x = 0; x < GRID_SIZE; x++) {
+        defs.push({ x, y, id }); id++;
+      }
+    });
+    setCustomAgents(defs);
+    nextAgentId.current = defs.length;
+  }, []);
+
+  // recompute sim on shape/barriers/customAgents/customShapeCells change
+  useEffect(() => {
+    // shape cells: handle custom vs predefined
+    let cells;
+    if (shapeType === 'custom') {
+      cells = customShapeCells.slice().sort((a, b) => a.x - b.x || a.y - b.y);
+    } else {
+      const raw = shapeType === 'diamond'
+        ? generateDiamond(GRID_SIZE)
+        : generateRectangle(GRID_SIZE);
+      cells = raw
+        .map(p => ({ x: p.x, y: GRID_SIZE - 1 - p.y }))
+        .sort((a, b) => a.x - b.x || a.y - b.y);
+    }
+    setShapeCells(cells);
+
+    // build agent objects & plan
+    const list = customAgents.map(a => ({
+      x: a.x, y: a.y, id: a.id, dest: null, path: []
+    }));
+    const assignMap = hungarianAssignment(list, cells);
+
+    const occ = new Set();
+    list.forEach(a => occ.add(`${a.x},${a.y},0`));
+    list.forEach(a => {
+      a.dest = assignMap[a.id];
+      const rawPath = planPath(
+        { x: a.x, y: a.y }, a.dest, 0, barriers, occ
+      ) || [{ pos: { x: a.x, y: a.y }, t: 0 }];
+      a.path = rawPath.map(s => s.pos);
+      rawPath.forEach(s => occ.add(`${s.pos.x},${s.pos.y},${s.t}`));
+      const last = rawPath[rawPath.length - 1];
+      for (let t = last.t + 1; t <= SIMULATION_STEPS; t++) {
+        occ.add(`${last.pos.x},${last.pos.y},${t}`);
+        a.path.push({ x: last.pos.x, y: last.pos.y });
+      }
+    });
+    reservationRef.current = occ;
+
+    setAgents(list);
+    setIter(0);
+    setHistory([ list.map(a => ({ x: a.x, y: a.y })) ]);
+    clearInterval(intervalRef.current);
+    intervalRef.current = null;
+  }, [shapeType, barriers, customAgents, customShapeCells]);
+
+  // check if all in shape & auto-stop run if done
+  const allInShape = agents.length > 0 && agents.every(a =>
+    shapeCells.some(c => c.x === a.x && c.y === a.y)
+  );
+  useEffect(() => {
+    if (intervalRef.current && allInShape) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, [agents, allInShape]);
+
+  // movement & controls
+  const moveTo = step => {
+    setAgents(prev => {
+      const reserved = new Set();
+      return prev.map(agent => {
+        const desired = step < agent.path.length
+          ? agent.path[step]
+          : agent.path[agent.path.length - 1];
+        const key = `${desired.x},${desired.y}`;
+        if (reserved.has(key)) {
+          reserved.add(`${agent.x},${agent.y}`);
+          return agent;
+        } else {
+          reserved.add(key);
+          return { ...agent, x: desired.x, y: desired.y };
+        }
+      });
+    });
+    setHistory(h => [...h, agents.map(a => ({ x: a.x, y: a.y }))]);
+    setIter(step);
+  };
+  const handleNext = () => { if (!allInShape) moveTo(Math.min(iter + 1, SIMULATION_STEPS)); };
+  const handleBack = () => {
+    if (iter === 0) return;
+    const ni = iter - 1, snap = history[ni];
+    setAgents(prev => prev.map((a, i) => ({ ...a, x: snap[i].x, y: snap[i].y })));
+    setIter(ni);
+  };
+  const handleRun = () => {
+    if (allInShape || intervalRef.current) return;
+    intervalRef.current = setInterval(handleNext, 500);
+  };
+  const handleStop = () => {
+    clearInterval(intervalRef.current);
+    intervalRef.current = null;
+  };
+  const handleReset = () => {
+    setBarriers(new Set());
+    setBarrierMode(false);
+    setAgentMode('none');
+    setShapeType('diamond');
+    setCustomShapeMode(false);
+    setCustomShapeCells([]);
+    const defs = [];
+    let id = 0;
+    [1, 0].forEach(pyY => {
+      const y = GRID_SIZE - 1 - pyY;
+      for (let x = 0; x < GRID_SIZE; x++) {
+        defs.push({ x, y, id }); id++;
+      }
+    });
+    setCustomAgents(defs);
+    nextAgentId.current = defs.length;
+  };
+
+  return (
+    <Box sx={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
+      <Drawer
+        variant="permanent"
+        sx={{
+          width: DRAWER_WIDTH,
+          '& .MuiDrawer-paper': { width: DRAWER_WIDTH, p: 2 }
+        }}
+      >
+        <Typography variant="h6">Controls</Typography>
+        <Stack spacing={2} mt={2}>
+          {/* Shape selector */}
+          <FormControl fullWidth>
+            <InputLabel>Shape</InputLabel>
+            <Select
+              value={shapeType}
+              onChange={e => setShapeType(e.target.value)}
+              disabled={barrierMode || agentMode !== 'none' || customShapeMode}
+            >
+              <MenuItem value="diamond">Diamond</MenuItem>
+              <MenuItem value="rectangle">Rectangle</MenuItem>
+            </Select>
+          </FormControl>
+
+          {/* Custom Shape button */}
+          <Button
+            variant={customShapeMode ? 'contained' : 'outlined'}
+            onClick={() => {
+              if (customShapeMode) {
+                setCustomShapeMode(false);
+              } else {
+                setCustomShapeMode(true);
+                setBarrierMode(false);
+                setAgentMode('none');
+                setCustomShapeCells([]);
+                setShapeType('custom');
+              }
+            }}
+            disabled={barrierMode || agentMode !== 'none'}
+          >
+            {customShapeMode ? 'Finish Custom Shape' : 'Custom Shape'}
+          </Button>
+
+          {/* Barrier & Agent controls */}
+          <Button
+            variant={barrierMode ? 'contained' : 'outlined'}
+            onClick={() => {
+              setBarrierMode(!barrierMode);
+              if (!barrierMode) setAgentMode('none');
+            }}
+            disabled={agentMode !== 'none' || customShapeMode}
+          >
+            {barrierMode ? 'Finish Barriers' : 'Add Barriers'}
+          </Button>
+          <Button
+            variant={agentMode === 'add' ? 'contained' : 'outlined'}
+            onClick={() => { setAgentMode(agentMode === 'add' ? 'none' : 'add'); setBarrierMode(false); }}
+            disabled={barrierMode || customAgents.length >= 20 || customShapeMode}
+          >
+            {agentMode === 'add' ? 'Finish Adding' : 'Add Agent'}
+          </Button>
+          <Button
+            variant={agentMode === 'remove' ? 'contained' : 'outlined'}
+            onClick={() => { setAgentMode(agentMode === 'remove' ? 'none' : 'remove'); setBarrierMode(false); }}
+            disabled={barrierMode || customAgents.length === 0 || customShapeMode}
+          >
+            {agentMode === 'remove' ? 'Finish Removing' : 'Remove Agent'}
+          </Button>
+
+          {/* Simulation controls */}
+          <Button variant="contained" onClick={handleBack}   disabled={barrierMode||agentMode!=='none'||iter===0}>Back</Button>
+          <Button variant="contained" onClick={handleNext}   disabled={barrierMode||agentMode!=='none'||allInShape}>Next</Button>
+          <Button variant="contained" onClick={handleRun}    disabled={barrierMode||agentMode!=='none'||allInShape}>Run</Button>
+          <Button variant="contained" onClick={handleStop}   disabled={barrierMode||agentMode!=='none'}>Stop</Button>
+          <Button variant="outlined"  onClick={handleReset}  disabled={barrierMode||agentMode!=='none'}>Reset All</Button>
+
+          <Typography>Step: {iter}</Typography>
+          <Typography>Agents: {customAgents.length}/20</Typography>
+          <Typography>Shape Blocks: {shapeCells.length}/20</Typography>
+        </Stack>
+      </Drawer>
+
+      <Box component="main" sx={{
+        flexGrow: 1, display: 'flex',
+        alignItems: 'center', justifyContent: 'center',
+        p: 2, overflow: 'hidden'
+      }}>
+        <Paper elevation={3} sx={{ p: 2, background: '#fafafa' }}>
+          <svg width={GRID_SIZE * CELL_SIZE} height={GRID_SIZE * CELL_SIZE}>
+            {/* Grid lines */}
+            {Array.from({ length: GRID_SIZE + 1 }).map((_, i) => (
+              <React.Fragment key={i}>
+                <line
+                  x1={0} y1={i * CELL_SIZE}
+                  x2={GRID_SIZE * CELL_SIZE} y2={i * CELL_SIZE}
+                  stroke="#ddd"
+                />
+                <line
+                  x1={i * CELL_SIZE} y1={0}
+                  x2={i * CELL_SIZE} y2={GRID_SIZE * CELL_SIZE}
+                  stroke="#ddd"
+                />
+              </React.Fragment>
+            ))}
+
+            {/* Click overlay */}
+            {Array.from({ length: GRID_SIZE }).flatMap((_, y) =>
+              Array.from({ length: GRID_SIZE }).map((_, x) => {
+                const key = `${x},${y}`;
+                return (
+                  <rect
+                    key={`cell-${key}`}
+                    x={x * CELL_SIZE} y={y * CELL_SIZE}
+                    width={CELL_SIZE} height={CELL_SIZE}
+                    fill="transparent"
+                    onClick={() => {
+                      if (barrierMode) {
+                        if (shapeCells.some(c => c.x===x&&c.y===y)) return;
+                        if (customAgents.some(a=>a.x===x&&a.y===y)) return;
+                        setBarriers(prev => {
+                          const next = new Set(prev);
+                          next.has(key) ? next.delete(key) : next.add(key);
+                          return next;
+                        });
+                      }
+                      else if (agentMode === 'add') {
+                        if (customAgents.length >= 20) return;
+                        if (shapeCells.some(c=>c.x===x&&c.y===y)) return;
+                        if (barriers.has(key)) return;
+                        if (customAgents.some(a=>a.x===x&&a.y===y)) return;
+                        setCustomAgents(prev => [...prev, { x, y, id: nextAgentId.current++ }]);
+                      }
+                      else if (agentMode === 'remove') {
+                        setCustomAgents(prev => prev.filter(a => !(a.x===x&&a.y===y)));
+                      }
+                      else if (customShapeMode) {
+                        if (customShapeCells.some(c=>c.x===x&&c.y===y)) {
+                          setCustomShapeCells(prev => prev.filter(c => !(c.x===x&&c.y===y)));
+                        } else {
+                          if (customShapeCells.length >= 20) return;
+                          if (customAgents.some(a=>a.x===x&&a.y===y)) return;
+                          if (barriers.has(key)) return;
+                          setCustomShapeCells(prev => [...prev, { x, y }]);
+                        }
+                      }
+                    }}
+                  />
+                );
+              })
+            )}
+
+            {/* Shape */}
+            {shapeCells.map((c, i) => (
+              <rect
+                key={`shape-${i}`}
+                x={c.x * CELL_SIZE} y={c.y * CELL_SIZE}
+                width={CELL_SIZE} height={CELL_SIZE}
+                fill="red" opacity={0.6}
+              />
+            ))}
+
+            {/* Barriers */}
+            {Array.from(barriers).map(str => {
+              const [x, y] = str.split(',').map(Number);
+              return (
+                <rect
+                  key={`barrier-${str}`}
+                  x={x * CELL_SIZE} y={y * CELL_SIZE}
+                  width={CELL_SIZE} height={CELL_SIZE}
+                  fill="black"
+                />
+              );
+            })}
+
+            {/* Agents */}
+            {agents.map(a => (
+              <React.Fragment key={a.id}>
+                <circle
+                  cx={a.x * CELL_SIZE + CELL_SIZE/2}
+                  cy={a.y * CELL_SIZE + CELL_SIZE/2}
+                  r={CELL_SIZE * 0.3}
+                  fill="green" opacity={0.8}
+                />
+                <text
+                  x={a.x * CELL_SIZE + CELL_SIZE/2}
+                  y={a.y * CELL_SIZE + CELL_SIZE/2 + 4}
+                  fontSize={12} textAnchor="middle" fill="#000"
+                >
+                  {a.id}
+                </text>
+              </React.Fragment>
+            ))}
+          </svg>
+        </Paper>
+      </Box>
+    </Box>
+  );
+}
